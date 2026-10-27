@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from time import monotonic
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -70,7 +71,7 @@ class Scheduler(SchedulerIOMixin):
         self.eos_token_id = self.tokenizer.eos_token_id
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
-        # self.config = config
+        self.config = config
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
@@ -216,10 +217,44 @@ class Scheduler(SchedulerIOMixin):
             write_tuple=write_mapping,
         )
 
+    def _admit_new_prefills(self) -> bool:
+        wait_sec = self.config.delay_prefill_wait_sec
+        min_batch_size = self.config.delay_prefill_min_batch_size
+        if (wait_sec == 0 and min_batch_size == 0) or not self.prefill_manager.runnable:
+            return True
+
+        admit = False
+        if self.config.tp_info.is_primary():
+            fresh = [req for req in self.prefill_manager.pending_list if req.chunked_req is None]
+            now = monotonic()
+            oldest_wait = max((now - req.queued_at for req in fresh), default=0.0)
+            admit = (
+                not self.decode_manager.runnable
+                or not fresh
+                or (min_batch_size > 0 and len(fresh) >= min_batch_size)
+                or (wait_sec > 0 and oldest_wait >= wait_sec)
+            )
+            if self.config.delay_prefill_debug:
+                logger.info_rank0(
+                    "Delay prefill: admit=%s waiting=%d oldest_wait=%.3fs decoding=%d",
+                    admit,
+                    len(fresh),
+                    oldest_wait,
+                    len(self.decode_manager.running_reqs),
+                )
+
+        # Only rank 0 evaluates time: local clocks must not select different TP batches.
+        if self.config.tp_info.size > 1:
+            decision = torch.tensor(int(admit), dtype=torch.int64, device="cpu")
+            self.tp_cpu_group.broadcast(decision, root=0).wait()
+            admit = bool(decision.item())
+        return admit
+
     def _schedule_next_batch(self) -> ForwardInput | None:
-        # TODO: support other policies: e.g. DECODE first
         batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
+            self.prefill_manager.schedule_next_batch(
+                self.prefill_budget, admit_new_requests=self._admit_new_prefills()
+            )
             or self.decode_manager.schedule_next_batch()
         )
         return self._prepare_batch(batch) if batch else None

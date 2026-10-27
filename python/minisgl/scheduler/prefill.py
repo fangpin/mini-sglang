@@ -123,7 +123,9 @@ class PrefillManager:
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params))
 
-    def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
+    def schedule_next_batch(
+        self, prefill_budget: int, *, admit_new_requests: bool = True
+    ) -> Batch | None:
         if len(self.pending_list) == 0:
             return None
 
@@ -137,6 +139,9 @@ class PrefillManager:
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
         for pending_req in self.pending_list:
+            # Chunked requests stay at the front and must keep making progress.
+            if not admit_new_requests and pending_req.chunked_req is None:
+                break
             if req := adder.try_add_one(pending_req):
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedReq):

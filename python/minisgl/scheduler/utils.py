@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from time import monotonic
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -17,6 +18,7 @@ class PendingReq:
     input_ids: torch.Tensor
     sampling_params: SamplingParams
     chunked_req: ChunkedReq | None = None
+    queued_at: float = field(default_factory=monotonic)
 
     @property
     def input_len(self) -> int:

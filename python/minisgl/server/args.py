@@ -179,6 +179,24 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--delay-prefill-wait-sec",
+        type=float,
+        default=ServerArgs.delay_prefill_wait_sec,
+        help="Admit waiting prefills after this many seconds; 0 disables the time threshold.",
+    )
+    parser.add_argument(
+        "--delay-prefill-min-batch-size",
+        type=int,
+        default=ServerArgs.delay_prefill_min_batch_size,
+        help="Admit waiting prefills when this many new requests queue; 0 disables this threshold.",
+    )
+    parser.add_argument(
+        "--delay-prefill-debug",
+        action="store_true",
+        help="Log delayed prefill admission decisions on TP rank 0.",
+    )
+
+    parser.add_argument(
         "--page-size",
         type=int,
         default=ServerArgs.page_size,
