@@ -34,6 +34,78 @@ Chunked Prefill, a technique introduced by [Sarathi-Serve](https://arxiv.org/abs
 
 You can specify the page size of the system using the `--page-size` argument.
 
+## Delayed Prefill Admission
+
+By default, the scheduler runs a prefill batch whenever one can be formed, then falls
+back to decode. To accumulate new prefills while existing requests decode, enable
+waiting-time, request-count, or admission-pass thresholds, alone or in combination:
+
+```bash
+python -m minisgl --model Qwen/Qwen3-0.6B \
+  --delay-prefill-wait-sec 0.05 \
+  --delay-prefill-min-batch-size 8
+```
+
+For pass-based delay, use:
+
+```bash
+python -m minisgl --model Qwen/Qwen3-0.6B --delay-prefill-max-passes 3
+```
+
+New prefills become eligible when **any** enabled threshold is reached: the oldest
+waiting request's age, the number of new waiting requests, or the admission-pass limit.
+With no runnable decode requests, prefills are eligible immediately. All thresholds
+default to zero (disabled); zero thresholds are ignored when another is enabled.
+The corresponding `SchedulerConfig` fields are `delay_prefill_wait_sec`,
+`delay_prefill_min_batch_size`, and `delay_prefill_max_passes`, including for offline inference.
+
+A pass is one scheduler admission attempt, not a completed GPU decode or one output
+token. With `--delay-prefill-max-passes 3`, at most two attempts reject new prefills;
+the third allows admission. A value of 1 never delays admission. Time or request-count
+thresholds can release earlier. Each rejected attempt counts even if an existing
+chunk continues instead of a decode batch running; inspecting admission alone does
+not advance the counter.
+
+With the pass limit enabled, once admission is allowed it stays open until at least
+one fresh request starts (including its first chunk) or no fresh requests remain.
+Resource shortages and old chunk-only batches do not restart the wait. Starting a
+fresh request resets the counter, even if other fresh requests remain queued. New
+arrivals join the current delay episode; aborting some requests preserves it, while
+aborting the last fresh request clears it before subsequent arrivals. This is a
+scheduler-level delay episode, not a per-request pass counter. The pass limit bounds
+policy rejections, not wall-clock wait or TTFT. Without it, the existing time/count
+policy continues to evaluate its thresholds on every attempt.
+
+Waiting time starts when the scheduler queues a request and uses a monotonic clock.
+TP ranks make queue-, count-, and pass-based decisions locally. When admission depends on
+waiting time, rank 0 evaluates the clock and broadcasts the decision so every rank
+selects the same phase. Already started chunked prefills continue without waiting for
+new requests; they do not count toward the request threshold. Prefix-cache matches still count as
+new requests until their first chunk is scheduled. Actual batches remain subject to
+the existing token budget, request slots, and KV cache capacity. If eligible prefills
+cannot allocate resources, decode continues.
+
+Decode requests stay in the decode manager during prefill batches, and both normal
+and overlap scheduling retain their usual output processing. Add
+`--delay-prefill-debug` to log admission decisions, new waiting request counts, oldest
+wait time, decode counts, and prior rejected passes (`delayed_passes`) on rank 0.
+The default is no extra logging.
+
+This policy trades extra prefill queueing and occasional decode pauses for potentially
+more consecutive decode steps and larger prefill batches. The time threshold is not a
+TTFT bound. A count-only threshold can delay sparse arrivals for as long as decode
+remains active. Sustained prefill backlog can produce consecutive prefill batches;
+there is no limit on the length of a prefill burst.
+
+Validate output completeness before measuring performance. Compare disabled and
+enabled runs with the same model, CUDA graph settings, input/output lengths, cache
+state, and arrival sequence. Measure actual delivered output tokens/s, TTFT, and
+inter-token latency percentiles under sparse, bursty, and sustained traffic; an
+improvement in average decode latency alone does not establish a serving benefit.
+CPU scheduling regressions can be run with
+`PYTHONPATH=python pytest tests/core/test_delay_prefill.py`; model correctness and
+performance additionally require a Linux CUDA host.
+
 ## Attention Backends
 
 Mini-SGLang integrates high-performance attention kernels, including [`FlashAttention`](https://github.com/Dao-AILab/flash-attention) (`fa`), [`FlashInfer`](https://github.com/flashinfer-ai/flashinfer) (`fi`) and [`TensorRT-LLM fmha`](https://github.com/NVIDIA/TensorRT-LLM) (`trtllm`). It supports using different backends for the prefill and decode phases to maximize efficiency. For example, on NVIDIA Hopper GPUs, `FlashAttention 3` is used for prefill and `FlashInfer` for decode by default.
