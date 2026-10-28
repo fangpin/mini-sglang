@@ -123,10 +123,20 @@ class PrefillManager:
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params))
 
+    def new_request_stats(self) -> Tuple[int, float | None]:
+        # Chunked requests form a prefix; fresh requests keep their enqueue order.
+        for index in range(len(self.pending_list)):
+            req = self.pending_list[index]
+            if req.chunked_req is None:
+                return len(self.pending_list) - index, req.queued_at
+        return 0, None
+
     def schedule_next_batch(
         self, prefill_budget: int, *, admit_new_requests: bool = True
     ) -> Batch | None:
         if len(self.pending_list) == 0:
+            return None
+        if not admit_new_requests and self.pending_list[0].chunked_req is None:
             return None
 
         # estimated offset due to in-flight decode

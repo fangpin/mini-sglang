@@ -223,31 +223,39 @@ class Scheduler(SchedulerIOMixin):
         if (wait_sec == 0 and min_batch_size == 0) or not self.prefill_manager.runnable:
             return True
 
-        admit = False
-        if self.config.tp_info.is_primary():
-            fresh = [req for req in self.prefill_manager.pending_list if req.chunked_req is None]
-            now = monotonic()
-            oldest_wait = max((now - req.queued_at for req in fresh), default=0.0)
-            admit = (
-                not self.decode_manager.runnable
-                or not fresh
-                or (min_batch_size > 0 and len(fresh) >= min_batch_size)
-                or (wait_sec > 0 and oldest_wait >= wait_sec)
-            )
-            if self.config.delay_prefill_debug:
-                logger.info_rank0(
-                    "Delay prefill: admit=%s waiting=%d oldest_wait=%.3fs decoding=%d",
-                    admit,
-                    len(fresh),
-                    oldest_wait,
-                    len(self.decode_manager.running_reqs),
-                )
+        fresh_count, oldest_queued_at = self.prefill_manager.new_request_stats()
+        # Queue and decode state agree across ranks, so these decisions need no collective.
+        admit = (
+            not self.decode_manager.runnable
+            or fresh_count == 0
+            or (min_batch_size > 0 and fresh_count >= min_batch_size)
+        )
+        needs_time_check = not admit and wait_sec > 0
+        is_primary = self.config.tp_info.is_primary()
+        oldest_wait = 0.0
+        if (
+            is_primary
+            and oldest_queued_at is not None
+            and (needs_time_check or self.config.delay_prefill_debug)
+        ):
+            oldest_wait = monotonic() - oldest_queued_at
 
-        # Only rank 0 evaluates time: local clocks must not select different TP batches.
-        if self.config.tp_info.size > 1:
-            decision = torch.tensor(int(admit), dtype=torch.int64, device="cpu")
-            self.tp_cpu_group.broadcast(decision, root=0).wait()
-            admit = bool(decision.item())
+        if needs_time_check:
+            # Only rank 0 evaluates time: local clocks must not select different TP batches.
+            admit = is_primary and oldest_wait >= wait_sec
+            if self.config.tp_info.size > 1:
+                decision = torch.tensor(int(admit), dtype=torch.int64, device="cpu")
+                self.tp_cpu_group.broadcast(decision, root=0).wait()
+                admit = bool(decision.item())
+
+        if self.config.delay_prefill_debug and is_primary:
+            logger.info_rank0(
+                "Delay prefill: admit=%s waiting=%d oldest_wait=%.3fs decoding=%d",
+                admit,
+                fresh_count,
+                oldest_wait,
+                len(self.decode_manager.running_reqs),
+            )
         return admit
 
     def _schedule_next_batch(self) -> ForwardInput | None:

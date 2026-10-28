@@ -54,9 +54,10 @@ The corresponding `SchedulerConfig` fields are `delay_prefill_wait_sec` and
 `delay_prefill_min_batch_size`, including for offline inference.
 
 Waiting time starts when the scheduler queues a request and uses a monotonic clock.
-TP rank 0 decides admission and broadcasts the decision so every rank selects the same
-phase. Already started chunked prefills continue without waiting for new requests;
-they do not count toward the request threshold. Prefix-cache matches still count as
+TP ranks make queue- and count-based decisions locally. When admission depends on
+waiting time, rank 0 evaluates the clock and broadcasts the decision so every rank
+selects the same phase. Already started chunked prefills continue without waiting for
+new requests; they do not count toward the request threshold. Prefix-cache matches still count as
 new requests until their first chunk is scheduled. Actual batches remain subject to
 the existing token budget, request slots, and KV cache capacity. If eligible prefills
 cannot allocate resources, decode continues.

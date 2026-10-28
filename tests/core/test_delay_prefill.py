@@ -105,9 +105,11 @@ def test_idle_admits_immediately(cpu_scheduler):
 
 
 def test_abort_delayed_request(cpu_scheduler):
-    add_pending(cpu_scheduler, uid=1)
-    add_pending(cpu_scheduler, uid=2)
+    add_pending(cpu_scheduler, uid=1, age=1.25)
+    add_pending(cpu_scheduler, uid=2, age=0.5)
+    assert cpu_scheduler.prefill_manager.new_request_stats() == (2, 98.75)
     cpu_scheduler._process_one_msg(AbortBackendMsg(uid=1))
+    assert cpu_scheduler.prefill_manager.new_request_stats() == (1, 99.5)
     assert cpu_scheduler._schedule_next_batch().is_decode
     assert [req.uid for req in cpu_scheduler.prefill_manager.pending_list] == [2]
 
@@ -115,11 +117,14 @@ def test_abort_delayed_request(cpu_scheduler):
 def test_chunk_continues_without_admitting_fresh_requests(cpu_scheduler):
     scheduler = cpu_scheduler
     scheduler.prefill_budget = 2
+    assert scheduler.prefill_manager.new_request_stats() == (0, None)
     pending = add_pending(scheduler, length=5, age=1)
     first = scheduler._schedule_next_batch()
     assert isinstance(first.reqs[0], ChunkedReq)
+    assert scheduler.prefill_manager.new_request_stats() == (0, None)
     first.reqs[0].complete_one()
     fresh = add_pending(scheduler, uid=2)
+    assert scheduler.prefill_manager.new_request_stats() == (1, fresh.queued_at)
     second = scheduler._schedule_next_batch()
     assert [req.uid for req in second.reqs] == [pending.uid]
     assert isinstance(second.reqs[0], ChunkedReq)
@@ -128,6 +133,7 @@ def test_chunk_continues_without_admitting_fresh_requests(cpu_scheduler):
     assert [req.uid for req in third.reqs] == [pending.uid]
     assert not isinstance(third.reqs[0], ChunkedReq)
     assert scheduler.prefill_manager.pending_list == [fresh]
+    assert scheduler.prefill_manager.new_request_stats() == (1, fresh.queued_at)
     assert scheduler._schedule_next_batch().is_decode
 
 
@@ -149,6 +155,125 @@ def test_disabled_policy_needs_no_tp_collective(cpu_scheduler):
     add_pending(cpu_scheduler)
     assert cpu_scheduler._schedule_next_batch().is_prefill
     cpu_scheduler.tp_cpu_group.broadcast.assert_not_called()
+
+
+@pytest.mark.parametrize("chunk_count", [0, 1, 2])
+@pytest.mark.parametrize("fresh_count", [1, 10000])
+def test_new_request_stats_only_reads_chunked_prefix(cpu_scheduler, chunk_count, fresh_count):
+    accesses = []
+
+    class PrefixOnlyList(list):
+        def __iter__(self):
+            raise AssertionError("must not iterate over the pending queue")
+
+        def __getitem__(self, index):
+            assert isinstance(index, int) and 0 <= index <= chunk_count
+            accesses.append(index)
+            return super().__getitem__(index)
+
+    queue = [SimpleNamespace(chunked_req=object()) for _ in range(chunk_count)]
+    queue.append(SimpleNamespace(chunked_req=None, queued_at=0.0))
+    queue.extend([object()] * (fresh_count - 1))
+    cpu_scheduler.prefill_manager.pending_list = PrefixOnlyList(queue)
+    assert cpu_scheduler.prefill_manager.new_request_stats() == (fresh_count, 0.0)
+    assert accesses == list(range(chunk_count + 1))
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize(
+    "wait_sec,min_batch,count,chunked,decoding,expected",
+    [
+        (0, 0, 1, False, True, True),
+        (1, 2, 0, False, True, True),
+        (1, 2, 1, False, False, True),
+        (1, 2, 1, True, True, True),
+        (1, 2, 2, False, True, True),
+        (0, 2, 2, False, True, True),
+        (0, 2, 1, False, True, False),
+    ],
+)
+def test_deterministic_admission_needs_no_clock_or_collective(
+    cpu_scheduler, monkeypatch, rank, wait_sec, min_batch, count, chunked, decoding, expected
+):
+    scheduler = cpu_scheduler
+    scheduler.config = replace(
+        make_config(delay_prefill_wait_sec=wait_sec, delay_prefill_min_batch_size=min_batch),
+        tp_info=DistributedInfo(rank, 2),
+    )
+    scheduler.tp_cpu_group = Mock()
+    for uid in range(count):
+        pending = add_pending(scheduler, uid=uid)
+        if chunked:
+            pending.chunked_req = make_req(uid)
+    if not decoding:
+        scheduler.decode_manager.running_reqs.clear()
+    clock = Mock(side_effect=AssertionError("deterministic admission must not read the clock"))
+    monkeypatch.setattr("minisgl.scheduler.scheduler.monotonic", clock)
+    assert scheduler._admit_new_prefills() is expected
+    clock.assert_not_called()
+    scheduler.tp_cpu_group.broadcast.assert_not_called()
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("debug", [False, True])
+@pytest.mark.parametrize(
+    "wait_sec,min_batch,age,expected",
+    [(0, 2, 0.5, False), (1, 1, 0.5, True), (1, 0, 1.25, True), (1, 0, 0.5, False)],
+)
+def test_admission_clock_and_debug_logging(
+    cpu_scheduler, monkeypatch, rank, debug, wait_sec, min_batch, age, expected
+):
+    scheduler = cpu_scheduler
+    scheduler.config = replace(
+        make_config(
+            delay_prefill_wait_sec=wait_sec,
+            delay_prefill_min_batch_size=min_batch,
+            delay_prefill_debug=debug,
+        ),
+        tp_info=DistributedInfo(rank, 2),
+    )
+    add_pending(scheduler, age=age)
+    clock = Mock(return_value=100.0)
+    log = Mock()
+    work = Mock()
+    scheduler.tp_cpu_group = Mock()
+
+    def broadcast(decision, root):
+        assert root == 0
+        decision.fill_(int(expected))
+        return work
+
+    scheduler.tp_cpu_group.broadcast.side_effect = broadcast
+    monkeypatch.setattr("minisgl.scheduler.scheduler.monotonic", clock)
+    monkeypatch.setattr("minisgl.scheduler.scheduler.logger.info_rank0", log)
+    assert scheduler._admit_new_prefills() is expected
+    needs_time_check = wait_sec > 0 and min_batch != 1
+    assert clock.call_count == int(rank == 0 and (debug or needs_time_check))
+    assert scheduler.tp_cpu_group.broadcast.call_count == int(needs_time_check)
+    assert work.wait.call_count == int(needs_time_check)
+    if debug and rank == 0:
+        log.assert_called_once_with(
+            "Delay prefill: admit=%s waiting=%d oldest_wait=%.3fs decoding=%d",
+            expected,
+            1,
+            age,
+            1,
+        )
+    else:
+        log.assert_not_called()
+
+
+def test_rejected_fresh_requests_skip_resource_estimation(cpu_scheduler, monkeypatch):
+    pending = add_pending(cpu_scheduler)
+    inflight_tokens = Mock(side_effect=AssertionError("must not estimate decode resources"))
+    adder = Mock(side_effect=AssertionError("must not construct a prefill adder"))
+    monkeypatch.setattr(DecodeManager, "inflight_tokens", property(inflight_tokens))
+    monkeypatch.setattr("minisgl.scheduler.prefill.PrefillAdder", adder)
+    assert cpu_scheduler._schedule_next_batch().is_decode
+    inflight_tokens.assert_not_called()
+    adder.assert_not_called()
+    assert cpu_scheduler.prefill_manager.pending_list == [pending]
+    assert cpu_scheduler.table_manager.available_size == 8
 
 
 @pytest.mark.parametrize(
@@ -193,16 +318,36 @@ def _tp_worker(rank, path):
     try:
         scheduler = make_scheduler(make_config(delay_prefill_wait_sec=1))
         scheduler.config = replace(scheduler.config, tp_info=DistributedInfo(rank, 2))
-        scheduler.tp_cpu_group = dist.distributed_c10d._get_default_group()
+        group = dist.distributed_c10d._get_default_group()
+        scheduler.tp_cpu_group = Mock(wraps=group)
         scheduler.decode_manager.running_reqs.add(make_req())
         pending = add_pending(scheduler)
         # Rank 1's age is deliberately the opposite of rank 0's on each decision.
         from time import monotonic
 
-        for admit in [False, True]:
+        for step, admit in enumerate([False, True]):
+            scheduler.config = replace(
+                scheduler.config, delay_prefill_wait_sec=1, delay_prefill_min_batch_size=1
+            )
+            assert scheduler._admit_new_prefills()
+            scheduler.config = replace(
+                scheduler.config, delay_prefill_wait_sec=0, delay_prefill_min_batch_size=2
+            )
+            assert not scheduler._admit_new_prefills()
+            assert scheduler.tp_cpu_group.broadcast.call_count == step
+
+            scheduler.config = replace(
+                scheduler.config, delay_prefill_wait_sec=1, delay_prefill_min_batch_size=0
+            )
             local_age = 10 if (admit == (rank == 0)) else -1000
             pending.queued_at = monotonic() - local_age
             assert scheduler._admit_new_prefills() == admit
+            assert scheduler.tp_cpu_group.broadcast.call_count == step + 1
+
+            # The next I/O collective must not consume an admission decision.
+            marker = torch.tensor(100 + step if rank == 0 else -1)
+            group.broadcast(marker, root=0).wait()
+            assert marker.item() == 100 + step
     finally:
         dist.destroy_process_group()
 
