@@ -19,6 +19,7 @@ class SchedulerConfig(EngineConfig):
     offline_mode: bool = False
     delay_prefill_wait_sec: float = 0.0
     delay_prefill_min_batch_size: int = 0
+    delay_prefill_max_passes: int = 0
     delay_prefill_debug: bool = False
 
     # networking config
@@ -29,6 +30,8 @@ class SchedulerConfig(EngineConfig):
             raise ValueError("delay_prefill_wait_sec must be finite and non-negative")
         if self.delay_prefill_min_batch_size < 0:
             raise ValueError("delay_prefill_min_batch_size must be non-negative")
+        if self.delay_prefill_max_passes < 0:
+            raise ValueError("delay_prefill_max_passes must be non-negative")
 
     @property
     def zmq_backend_addr(self) -> str:

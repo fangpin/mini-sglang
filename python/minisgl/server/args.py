@@ -191,6 +191,12 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="Admit waiting prefills when this many new requests queue; 0 disables this threshold.",
     )
     parser.add_argument(
+        "--delay-prefill-max-passes",
+        type=int,
+        default=ServerArgs.delay_prefill_max_passes,
+        help="Allow new prefills on this admission pass at the latest; 0 disables, 1 never delays.",
+    )
+    parser.add_argument(
         "--delay-prefill-debug",
         action="store_true",
         help="Log delayed prefill admission decisions on TP rank 0.",

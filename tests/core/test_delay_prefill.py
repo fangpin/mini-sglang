@@ -15,7 +15,7 @@ import torch.multiprocessing as mp
 from minisgl.core import Req, SamplingParams
 from minisgl.distributed import DistributedInfo
 from minisgl.engine import ForwardOutput
-from minisgl.message import AbortBackendMsg, UserMsg
+from minisgl.message import AbortBackendMsg, BatchBackendMsg, UserMsg
 from minisgl.scheduler import Scheduler, SchedulerConfig
 from minisgl.scheduler.cache import CacheManager
 from minisgl.scheduler.decode import DecodeManager
@@ -45,6 +45,7 @@ def add_pending(scheduler, uid=1, *, age=0.0, length=2, output_len=4):
 def make_scheduler(config=None):
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.config = config or make_config()
+    scheduler._reset_prefill_delay()
     scheduler.decode_manager = DecodeManager(page_size=1)
     scheduler.table_manager = TableManager(8, torch.zeros((8, 128), dtype=torch.int32))
     scheduler.cache_manager = CacheManager(1024, 1, scheduler.table_manager.page_table, "naive")
@@ -253,11 +254,12 @@ def test_admission_clock_and_debug_logging(
     assert work.wait.call_count == int(needs_time_check)
     if debug and rank == 0:
         log.assert_called_once_with(
-            "Delay prefill: admit=%s waiting=%d oldest_wait=%.3fs decoding=%d",
+            "Delay prefill: admit=%s waiting=%d oldest_wait=%.3fs decoding=%d delayed_passes=%d",
             expected,
             1,
             age,
             1,
+            0,
         )
     else:
         log.assert_not_called()
@@ -276,6 +278,166 @@ def test_rejected_fresh_requests_skip_resource_estimation(cpu_scheduler, monkeyp
     assert cpu_scheduler.table_manager.available_size == 8
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("max_passes", [0, 1, 2, 3])
+def test_pass_threshold_and_episode_reset(cpu_scheduler, monkeypatch, rank, max_passes):
+    scheduler = cpu_scheduler
+    scheduler.config = replace(
+        make_config(delay_prefill_max_passes=max_passes), tp_info=DistributedInfo(rank, 2)
+    )
+    scheduler.tp_cpu_group = Mock()
+    clock = Mock(side_effect=AssertionError("pass admission must not read the clock"))
+    monkeypatch.setattr("minisgl.scheduler.scheduler.monotonic", clock)
+    for uid in [1, 2]:
+        add_pending(scheduler, uid=uid)
+        for delayed in range(max(0, max_passes - 1)):
+            # Inspecting admission is not a scheduling pass.
+            assert not scheduler._admit_new_prefills()
+            assert not scheduler._admit_new_prefills()
+            assert scheduler._delayed_prefill_passes == delayed
+            assert scheduler._schedule_next_batch().is_decode
+            assert scheduler._delayed_prefill_passes == delayed + 1
+        assert scheduler._schedule_next_batch().is_prefill
+        assert scheduler._delayed_prefill_passes == 0
+        assert not scheduler._prefill_admission_open
+    clock.assert_not_called()
+    scheduler.tp_cpu_group.broadcast.assert_not_called()
+
+
+def test_pass_counter_resets_after_partial_fresh_admission(cpu_scheduler):
+    scheduler = cpu_scheduler
+    scheduler.config = make_config(delay_prefill_max_passes=2)
+    scheduler.prefill_budget = 2
+    add_pending(scheduler, uid=1, length=2)
+    remaining = add_pending(scheduler, uid=2, length=2)
+    assert scheduler._schedule_next_batch().is_decode
+    batch = scheduler._schedule_next_batch()
+    assert [req.uid for req in batch.reqs] == [1]
+    assert scheduler.prefill_manager.pending_list == [remaining]
+    assert scheduler._delayed_prefill_passes == 0
+    assert scheduler._schedule_next_batch().is_decode
+    assert scheduler._schedule_next_batch().is_prefill
+
+
+@pytest.mark.parametrize("trigger", ["time", "count", "idle"])
+def test_other_thresholds_release_before_pass_limit(cpu_scheduler, trigger):
+    scheduler = cpu_scheduler
+    scheduler.config = make_config(
+        delay_prefill_max_passes=3, delay_prefill_wait_sec=1, delay_prefill_min_batch_size=2
+    )
+    pending = add_pending(scheduler)
+    assert scheduler._schedule_next_batch().is_decode
+    if trigger == "time":
+        pending.queued_at = 99.0
+    elif trigger == "count":
+        add_pending(scheduler, uid=2)
+    else:
+        scheduler.decode_manager.running_reqs.clear()
+    assert scheduler._schedule_next_batch().is_prefill
+    assert scheduler._delayed_prefill_passes == 0
+
+
+@pytest.mark.parametrize("resource", ["table", "kv_cache"])
+def test_pass_release_survives_resource_shortage(cpu_scheduler, resource):
+    scheduler = cpu_scheduler
+    scheduler.config = make_config(delay_prefill_max_passes=3)
+    add_pending(scheduler)
+    if resource == "table":
+        while scheduler.table_manager.available_size:
+            table_idx = scheduler.table_manager.allocate()
+    else:
+        free_slots = scheduler.cache_manager.free_slots
+        scheduler.cache_manager.free_slots = torch.empty(0, dtype=torch.int32)
+    for delayed in [1, 2]:
+        assert scheduler._schedule_next_batch().is_decode
+        assert scheduler._delayed_prefill_passes == delayed
+    for _ in range(3):
+        assert scheduler._schedule_next_batch().is_decode
+        assert scheduler._prefill_admission_open
+        assert scheduler._delayed_prefill_passes == 2
+    if resource == "table":
+        scheduler.table_manager.free(table_idx)
+    else:
+        scheduler.cache_manager.free_slots = free_slots
+    assert scheduler._schedule_next_batch().is_prefill
+    assert scheduler._delayed_prefill_passes == 0
+    assert not scheduler._prefill_admission_open
+
+
+def test_count_release_stays_open_after_partial_abort(cpu_scheduler):
+    scheduler = cpu_scheduler
+    scheduler.config = make_config(delay_prefill_max_passes=3, delay_prefill_min_batch_size=2)
+    add_pending(scheduler, uid=1)
+    add_pending(scheduler, uid=2)
+    while scheduler.table_manager.available_size:
+        table_idx = scheduler.table_manager.allocate()
+    assert scheduler._schedule_next_batch().is_decode
+    assert scheduler._prefill_admission_open
+    scheduler._process_one_msg(AbortBackendMsg(uid=2))
+    scheduler.table_manager.free(table_idx)
+    assert scheduler._schedule_next_batch().is_prefill
+    assert not scheduler._prefill_admission_open
+
+
+def test_abort_last_fresh_resets_before_same_message_batch_arrival(cpu_scheduler):
+    scheduler = cpu_scheduler
+    scheduler.config = make_config(delay_prefill_max_passes=3)
+    scheduler.engine = SimpleNamespace(max_seq_len=128)
+    add_pending(scheduler, uid=1)
+    add_pending(scheduler, uid=2)
+    assert scheduler._schedule_next_batch().is_decode
+    scheduler._process_one_msg(AbortBackendMsg(uid=1))
+    assert scheduler._delayed_prefill_passes == 1
+    assert scheduler._schedule_next_batch().is_decode
+    scheduler._process_one_msg(
+        BatchBackendMsg(
+            data=[
+                AbortBackendMsg(uid=2),
+                UserMsg(3, torch.tensor([10, 11]), SamplingParams(max_tokens=4)),
+            ]
+        )
+    )
+    assert scheduler._delayed_prefill_passes == 0
+    assert not scheduler._prefill_admission_open
+    assert scheduler._schedule_next_batch().is_decode
+    assert scheduler._delayed_prefill_passes == 1
+
+
+def test_empty_queue_clears_pass_state(cpu_scheduler):
+    scheduler = cpu_scheduler
+    scheduler.config = make_config(delay_prefill_max_passes=3)
+    scheduler._delayed_prefill_passes = 2
+    scheduler._prefill_admission_open = True
+    assert scheduler._schedule_next_batch().is_decode
+    assert scheduler._delayed_prefill_passes == 0
+    assert not scheduler._prefill_admission_open
+
+
+def test_chunks_preserve_wait_until_fresh_first_chunk_starts(cpu_scheduler):
+    scheduler = cpu_scheduler
+    scheduler.config = make_config(delay_prefill_max_passes=3, delay_prefill_wait_sec=1)
+    scheduler.prefill_budget = 2
+    add_pending(scheduler, uid=1, length=9, age=1)
+    first = scheduler._schedule_next_batch()
+    first.reqs[0].complete_one()
+    fresh = add_pending(scheduler, uid=2, length=3)
+    for delayed in [1, 2]:
+        batch = scheduler._schedule_next_batch()
+        assert [req.uid for req in batch.reqs] == [1]
+        assert scheduler._delayed_prefill_passes == delayed
+        batch.reqs[0].complete_one()
+    batch = scheduler._schedule_next_batch()
+    assert [req.uid for req in batch.reqs] == [1]
+    assert scheduler._prefill_admission_open
+    batch.reqs[0].complete_one()
+    batch = scheduler._schedule_next_batch()
+    assert [req.uid for req in batch.reqs] == [1, 2]
+    assert isinstance(batch.reqs[1], ChunkedReq)
+    assert fresh.chunked_req is batch.reqs[1]
+    assert scheduler._delayed_prefill_passes == 0
+    assert not scheduler._prefill_admission_open
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -283,6 +445,7 @@ def test_rejected_fresh_requests_skip_resource_estimation(cpu_scheduler, monkeyp
         ("delay_prefill_wait_sec", float("nan")),
         ("delay_prefill_wait_sec", float("inf")),
         ("delay_prefill_min_batch_size", -1),
+        ("delay_prefill_max_passes", -1),
     ],
 )
 def test_invalid_config(field, value):
@@ -303,11 +466,14 @@ def test_cli_options():
             "0.05",
             "--delay-prefill-min-batch-size",
             "8",
+            "--delay-prefill-max-passes",
+            "3",
             "--delay-prefill-debug",
         ]
     )
     assert config.delay_prefill_wait_sec == 0.05
     assert config.delay_prefill_min_batch_size == 8
+    assert config.delay_prefill_max_passes == 3
     assert config.delay_prefill_debug
 
 
@@ -348,6 +514,34 @@ def _tp_worker(rank, path):
             marker = torch.tensor(100 + step if rank == 0 else -1)
             group.broadcast(marker, root=0).wait()
             assert marker.item() == 100 + step
+
+        # Time can release a pass-limited episode early on both ranks. With no
+        # free slots, the next pass must retain that release without a collective.
+        while scheduler.table_manager.available_size:
+            scheduler.table_manager.allocate()
+        scheduler.config = replace(scheduler.config, delay_prefill_max_passes=3)
+        pending.queued_at = monotonic() - (-1000 if rank == 0 else 10)
+        assert scheduler._schedule_next_batch().is_decode
+        assert scheduler._delayed_prefill_passes == 1
+        pending.queued_at = monotonic() - (10 if rank == 0 else -1000)
+        assert scheduler._schedule_next_batch().is_decode
+        assert scheduler._prefill_admission_open
+        assert scheduler.tp_cpu_group.broadcast.call_count == 4
+        assert scheduler._schedule_next_batch().is_decode
+        assert scheduler.tp_cpu_group.broadcast.call_count == 4
+
+        scheduler._reset_prefill_delay()
+        scheduler.config = replace(scheduler.config, delay_prefill_wait_sec=0)
+        for delayed in [1, 2]:
+            assert scheduler._schedule_next_batch().is_decode
+            assert scheduler._delayed_prefill_passes == delayed
+            assert not scheduler._prefill_admission_open
+        assert scheduler._schedule_next_batch().is_decode
+        assert scheduler._prefill_admission_open
+        assert scheduler.tp_cpu_group.broadcast.call_count == 4
+        marker = torch.tensor(999 if rank == 0 else -1)
+        group.broadcast(marker, root=0).wait()
+        assert marker.item() == 999
     finally:
         dist.destroy_process_group()
 
@@ -357,8 +551,13 @@ def test_tp_ranks_follow_primary_clock(tmp_path):
 
 
 @pytest.mark.parametrize("overlap", [False, True])
-def test_decode_resumes_with_all_tokens_and_resources(cpu_scheduler, monkeypatch, overlap):
+@pytest.mark.parametrize("pass_based", [False, True])
+def test_decode_resumes_with_all_tokens_and_resources(
+    cpu_scheduler, monkeypatch, overlap, pass_based
+):
     scheduler = cpu_scheduler
+    if pass_based:
+        scheduler.config = make_config(delay_prefill_max_passes=2)
     scheduler.decode_manager.running_reqs.clear()
     scheduler.device = torch.device("cpu")
     scheduler.token_pool = scheduler.table_manager.token_pool

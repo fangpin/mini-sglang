@@ -72,6 +72,7 @@ class Scheduler(SchedulerIOMixin):
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
         self.config = config
+        self._reset_prefill_delay()
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
@@ -194,6 +195,10 @@ class Scheduler(SchedulerIOMixin):
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
             if req_to_free is not None:
                 self._free_req_resources(req_to_free)
+            if self.config.delay_prefill_max_passes > 0:
+                fresh_count, _ = self.prefill_manager.new_request_stats()
+                if fresh_count == 0:
+                    self._reset_prefill_delay()
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
@@ -217,10 +222,17 @@ class Scheduler(SchedulerIOMixin):
             write_tuple=write_mapping,
         )
 
+    def _reset_prefill_delay(self) -> None:
+        self._delayed_prefill_passes = 0
+        self._prefill_admission_open = False
+
     def _admit_new_prefills(self) -> bool:
         wait_sec = self.config.delay_prefill_wait_sec
         min_batch_size = self.config.delay_prefill_min_batch_size
-        if (wait_sec == 0 and min_batch_size == 0) or not self.prefill_manager.runnable:
+        max_passes = self.config.delay_prefill_max_passes
+        if (
+            wait_sec == 0 and min_batch_size == 0 and max_passes == 0
+        ) or not self.prefill_manager.runnable:
             return True
 
         fresh_count, oldest_queued_at = self.prefill_manager.new_request_stats()
@@ -229,6 +241,10 @@ class Scheduler(SchedulerIOMixin):
             not self.decode_manager.runnable
             or fresh_count == 0
             or (min_batch_size > 0 and fresh_count >= min_batch_size)
+            or (
+                max_passes > 0
+                and (self._prefill_admission_open or self._delayed_prefill_passes >= max_passes - 1)
+            )
         )
         needs_time_check = not admit and wait_sec > 0
         is_primary = self.config.tp_info.is_primary()
@@ -250,21 +266,38 @@ class Scheduler(SchedulerIOMixin):
 
         if self.config.delay_prefill_debug and is_primary:
             logger.info_rank0(
-                "Delay prefill: admit=%s waiting=%d oldest_wait=%.3fs decoding=%d",
+                "Delay prefill: admit=%s waiting=%d oldest_wait=%.3fs decoding=%d delayed_passes=%d",
                 admit,
                 fresh_count,
                 oldest_wait,
                 len(self.decode_manager.running_reqs),
+                self._delayed_prefill_passes,
             )
         return admit
 
     def _schedule_next_batch(self) -> ForwardInput | None:
-        batch = (
-            self.prefill_manager.schedule_next_batch(
-                self.prefill_budget, admit_new_requests=self._admit_new_prefills()
-            )
-            or self.decode_manager.schedule_next_batch()
+        count_passes = self.config.delay_prefill_max_passes > 0
+        if count_passes:
+            fresh_before, _ = self.prefill_manager.new_request_stats()
+            if fresh_before == 0:
+                self._reset_prefill_delay()
+
+        admit = self._admit_new_prefills()
+        batch = self.prefill_manager.schedule_next_batch(
+            self.prefill_budget, admit_new_requests=admit
         )
+        if count_passes:
+            fresh_after, _ = self.prefill_manager.new_request_stats()
+            if fresh_after == 0 or fresh_after < fresh_before:
+                # Starting a fresh request (including its first chunk) ends the delay episode.
+                self._reset_prefill_delay()
+            elif admit:
+                # Resource shortage or an existing chunk must not restart the wait.
+                self._prefill_admission_open = True
+            else:
+                self._delayed_prefill_passes += 1
+
+        batch = batch or self.decode_manager.schedule_next_batch()
         return self._prepare_batch(batch) if batch else None
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
